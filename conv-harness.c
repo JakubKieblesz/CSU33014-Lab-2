@@ -372,14 +372,15 @@ static void *conv_thread_func(void *varg)
       for (int h = 0; h < H; h++) {
         double sum = 0.0;
 
-        for (int c = 0; c < C; c++) {
-          int ker_mc_base = ker_m_base + c * ker_c_stride;
-          for (int x = 0; x < K; x++) {
-            int img_wx_base  = (w + x) * img_w_stride;
-            int ker_mcx_base = ker_mc_base + x * K;
-            for (int y = 0; y < K; y++) {
-              sum += img[img_wx_base + (h + y) * C + c]
-                   * ker[ker_mcx_base + y];
+        for (int x = 0; x < K; x++) {
+          int img_wx_base = (w + x) * img_w_stride;
+          for (int y = 0; y < K; y++) {
+            int img_wxy_base = img_wx_base + (h + y) * C;
+            int ker_mxy_base = ker_m_base + x * K + y;
+            for (int c = 0; c < C; c++) {
+              // c is innermost so image access is sequential - the cache thanks us!
+              sum += img[img_wxy_base + c]
+                   * ker[ker_mxy_base + c * ker_c_stride];
             }
           }
         }
