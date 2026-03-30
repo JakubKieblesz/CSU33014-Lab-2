@@ -34,6 +34,17 @@
    Version 1.1 : Fixed bug in code to create 4d matrix
 */
 
+
+
+// Authors 
+//  - Jakub Kieblesz
+//  - Kush Voorakkara
+//  - Conor Kelly
+
+
+
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -41,6 +52,7 @@
 #include <omp.h>
 #include <math.h>
 #include <stdint.h>
+#include <pthread.h>
 
 /* the following two definitions of DEBUGGING control whether or not
    debugging information is written out. To put the program into
@@ -320,16 +332,107 @@ void multichannel_conv(float *** image, int16_t **** kernels,
   }
 }
 
+
+
+#define NUM_THREADS 32
+
+// everything a single thread needs to know about its chunk of work
+typedef struct {
+  float   *image_1d;
+  int16_t *kernel_1d;
+  float   *output_1d;
+  int width, height, nchannels, nkernels, kernel_order;
+  int m_start, m_end;  // range of output kernels this thread handles
+} conv_args_t;
+
+
+// worker function - each thread runs this on its own slice of kernels 
+static void *conv_thread_func(void *varg)
+{
+  conv_args_t *a = (conv_args_t *)varg;
+
+  float   *img = a->image_1d;
+  int16_t *ker = a->kernel_1d;
+  float   *out = a->output_1d;
+
+  int W = a->width,     H = a->height;
+  int C = a->nchannels, K = a->kernel_order;
+
+  // pre-compute strides so we're not doing multiplications inside every loop
+  int img_w_stride = (H + K) * C;
+  int ker_m_stride = C * K * K;
+  int ker_c_stride = K * K;
+  int out_m_stride = W * H;
+
+  for (int m = a->m_start; m < a->m_end; m++) {
+    int ker_m_base = m * ker_m_stride;
+    int out_m_base = m * out_m_stride;
+
+    for (int w = 0; w < W; w++) {
+      for (int h = 0; h < H; h++) {
+        double sum = 0.0;
+
+        for (int c = 0; c < C; c++) {
+          int ker_mc_base = ker_m_base + c * ker_c_stride;
+          for (int x = 0; x < K; x++) {
+            int img_wx_base  = (w + x) * img_w_stride;
+            int ker_mcx_base = ker_mc_base + x * K;
+            for (int y = 0; y < K; y++) {
+              sum += img[img_wx_base + (h + y) * C + c]
+                   * ker[ker_mcx_base + y];
+            }
+          }
+        }
+        out[out_m_base + w * H + h] = (float)sum; 
+      }
+    }
+  }
+  return NULL;
+}
+
+
 /* the fast version of conv written by the student using pthreads */
 void student_conv_pthreads(float *** image, int16_t **** kernels, float *** output,
                int width, int height, int nchannels, int nkernels,
                int kernel_order)
 {
-  // this call here is just dummy code that calls the slow, simple, correct version.
-  // insert your own code instead
-  multichannel_conv(image, kernels, output, width,
-                    height, nchannels, nkernels, kernel_order);
+  pthread_t   threads[NUM_THREADS];
+  conv_args_t args[NUM_THREADS];
+
+  // pull out the raw 1D backing arrays - avoids pointer chasing on every access
+  float   *image_1d  = **image;
+  int16_t *kernel_1d = ***kernels;
+  float   *output_1d = **output;
+
+  /* no mutex needed - each thread writes to its own disjoint set of output
+     kernels (m_start..m_end-1), so there's no shared mutable state */
+  int nthreads = (nkernels < NUM_THREADS) ? nkernels : NUM_THREADS;
+  int base     = nkernels / nthreads;
+  int extra    = nkernels % nthreads;
+
+  for (int t = 0; t < nthreads; t++) {
+    args[t].image_1d     = image_1d;
+    args[t].kernel_1d    = kernel_1d;
+    args[t].output_1d    = output_1d;
+    args[t].width        = width;
+    args[t].height       = height;
+    args[t].nchannels    = nchannels;
+    args[t].nkernels     = nkernels;
+    args[t].kernel_order = kernel_order;
+    // spread kernels as evenly as possible across threads 
+    args[t].m_start = t * base + (t < extra ? t     : extra);
+    args[t].m_end   = args[t].m_start + base + (t < extra ? 1 : 0);
+    pthread_create(&threads[t], NULL, conv_thread_func, &args[t]);
+  }
+
+  for (int t = 0; t < nthreads; t++) {
+    pthread_join(threads[t], NULL);
+  }
 }
+
+
+
+
 
 /* the fast version of conv written by the student using OpenMP */
 void student_conv_openmp(float *** image, int16_t **** kernels, float *** output,
