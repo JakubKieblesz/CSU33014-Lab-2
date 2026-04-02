@@ -493,9 +493,14 @@ int main(int argc, char ** argv)
 
   //DEBUGGING(write_out(A, a_dim1, a_dim2));
 
-  /* use a simple multichannel convolution routine to produce control result */
+  /* time the control (reference) convolution */
+  gettimeofday(&start_time, NULL);
   multichannel_conv(image, kernels, control_output, width,
                     height, nchannels, nkernels, kernel_order);
+  gettimeofday(&stop_time, NULL);
+  mul_time = (stop_time.tv_sec - start_time.tv_sec) * 1000000L +
+    (stop_time.tv_usec - start_time.tv_usec);
+  printf("Control conv time: %lld microseconds\n", mul_time);
 
   /* record starting time of student's pthreads code*/
   gettimeofday(&start_time, NULL);
@@ -527,7 +532,7 @@ int main(int argc, char ** argv)
   gettimeofday(&stop_time, NULL);
   mul_time = (stop_time.tv_sec - start_time.tv_sec) * 1000000L +
     (stop_time.tv_usec - start_time.tv_usec);
-  printf("Student pthreads conv time: %lld microseconds\n", mul_time);
+  printf("Student OpenMP conv time: %lld microseconds\n", mul_time);
 
   DEBUGGING(write_out(output, nkernels, width, height));
 
