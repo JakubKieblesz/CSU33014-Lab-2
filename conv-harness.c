@@ -442,26 +442,59 @@ void student_conv_openmp(float *** image, int16_t **** kernels, float *** output
 {
   // this call here is just dummy code that calls the slow, simple, correct version.
   // insert your own code instead
+  int h, w, x, y, c, m;
+  int korder2 = kernel_order * kernel_order;
+  int padded_w = width + kernel_order - 1;
+  int padded_h = height + kernel_order - 1;
 
-  int m, w, h, x, y, c;
-
-    #pragma omp parallel for collapse(2) schedule(static) private(h, x, y, c)
-    for (m = 0; m < nkernels; m++) {
-        for (w = 0; w < width; w++) {
-            for (h = 0; h < height; h++) {
-                double sum = 0.0;
-                for (x = 0; x < kernel_order; x++) {
-                    for (y = 0; y < kernel_order; y++) {
-                        #pragma omp simd reduction(+:sum)
-                        for (c = 0; c < nchannels; c++) {
-                            sum += (double)image[w+x][h+y][c] * (double)kernels[m][c][x][y];
-                        }
-                    }
-                }
-                output[m][w][h] = (float)sum;
-            }
-        }
+  // Flatten the image into a 1d array to reduce the penalty from triple pointer dereferences
+  float *flat_image = malloc(padded_w * padded_h * nchannels * sizeof(float));
+  #pragma omp parallel for collapse(2) schedule(static)
+  for (int i = 0; i < padded_w; i++) {
+    for (int j = 0; j < padded_h; j++) {
+      for (int k = 0; k < nchannels; k++) {
+        flat_image[(i * padded_h + j) * nchannels + k] = image[i][j][k];
+      }
     }
+  }
+
+  // Flatten the kernel into another 1d array to reduce the penalty from quadruple pointer dereferences
+  float *flat_kernel = malloc(nkernels * korder2 * nchannels * sizeof(float));
+  #pragma omp parallel for collapse(2) schedule(static)
+  for (int i = 0; i < nkernels; i++) {
+    for (int j = 0; j < kernel_order; j++) {
+      for (int k = 0; k < kernel_order; k++) {
+        for (int l = 0; l < nchannels; l++) {
+          flat_kernel[((i * korder2 + j * kernel_order + k) * nchannels) + l] = (float)kernels[i][l][j][k];
+        }
+      }
+    }
+  }
+
+  // Main convolution group with OpenMP pragmas parallelising the outer 2 loops
+  #pragma omp parallel for collapse(2) schedule(static) private(h, x, y, c)
+  for ( m = 0; m < nkernels; m++ ) {
+    for ( w = 0; w < width; w++ ) {
+      for ( h = 0; h < height; h++ ) {
+        double sum = 0.0;
+        int base_kernel = m * korder2 * nchannels;
+        for ( x = 0; x < kernel_order; x++ ) {
+          for ( y = 0; y < kernel_order; y++) {
+            int image_offset = ((w + x) * padded_h + (h + y)) * nchannels;
+            int kernel_offset = base_kernel + (x * kernel_order + y) * nchannels;
+            // use a reduction since we are summing from all the threads into the one sum variable
+            #pragma omp simd reduction(+:sum)
+            for ( c = 0; c < nchannels; c++ ) {
+              sum += (double)flat_image[image_offset + c] * (double)flat_kernel[kernel_offset + c];
+            }
+          }
+        }
+        output[m][w][h] = (float) sum;
+      }
+    }
+  }
+  free(flat_image);
+  free(flat_kernel);  
 }
 
 
