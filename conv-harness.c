@@ -442,8 +442,26 @@ void student_conv_openmp(float *** image, int16_t **** kernels, float *** output
 {
   // this call here is just dummy code that calls the slow, simple, correct version.
   // insert your own code instead
-  multichannel_conv(image, kernels, output, width,
-                    height, nchannels, nkernels, kernel_order);
+
+  int m, w, h, x, y, c;
+
+    #pragma omp parallel for collapse(2) schedule(static) private(h, x, y, c)
+    for (m = 0; m < nkernels; m++) {
+        for (w = 0; w < width; w++) {
+            for (h = 0; h < height; h++) {
+                double sum = 0.0;
+                for (x = 0; x < kernel_order; x++) {
+                    for (y = 0; y < kernel_order; y++) {
+                        #pragma omp simd reduction(+:sum)
+                        for (c = 0; c < nchannels; c++) {
+                            sum += (double)image[w+x][h+y][c] * (double)kernels[m][c][x][y];
+                        }
+                    }
+                }
+                output[m][w][h] = (float)sum;
+            }
+        }
+    }
 }
 
 
@@ -527,7 +545,7 @@ int main(int argc, char ** argv)
   gettimeofday(&stop_time, NULL);
   mul_time = (stop_time.tv_sec - start_time.tv_sec) * 1000000L +
     (stop_time.tv_usec - start_time.tv_usec);
-  printf("Student pthreads conv time: %lld microseconds\n", mul_time);
+  printf("Student OpenMP conv time: %lld microseconds\n", mul_time);
 
   DEBUGGING(write_out(output, nkernels, width, height));
 
