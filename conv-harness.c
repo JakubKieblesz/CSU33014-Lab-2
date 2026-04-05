@@ -334,19 +334,20 @@ void multichannel_conv(float *** image, int16_t **** kernels,
 
 
 
+// stoker's core count is (4 processors * 8 cores = 32 threads)
 #define NUM_THREADS 32
 
-// everything a single thread needs to know about its chunk of work
+// struct to pass all necessary data to each thread
 typedef struct {
-  float   *image_1d;
-  int16_t *kernel_1d;
-  float   *output_1d;
+  float   *image_1d;   // pointer to flattened image array
+  int16_t *kernel_1d;  // pointer to flattened kernel array
+  float   *output_1d;  // pointer to flattened output array
   int width, height, nchannels, nkernels, kernel_order;
-  int m_start, m_end;  // range of output kernels this thread handles
+  int m_start, m_end;  // range of output kernels that this thread is responsible for
 } conv_args_t;
 
 
-// worker function - each thread runs this on its own slice of kernels 
+// worker function - each thread computes convolution for its assigned kernels
 static void *conv_thread_func(void *varg)
 {
   conv_args_t *a = (conv_args_t *)varg;
@@ -358,25 +359,28 @@ static void *conv_thread_func(void *varg)
   int W = a->width,     H = a->height;
   int C = a->nchannels, K = a->kernel_order;
 
-  // pre-compute strides so we're not doing multiplications inside every loop
-  int img_w_stride = (H + K) * C;
-  int ker_m_stride = C * K * K;
-  int ker_c_stride = K * K;
-  int out_m_stride = W * H;
+  // pre-compute strides once to avoid repeated multiplications in inner loops
+  int img_w_stride = (H + K) * C; // image is laid out as [w][h][c], so moving one step in w skips (H+K)*C elements
+  int ker_m_stride = C * K * K;   // kernel is laid out as [m][c][x][y], so moving one kernel skips C*K*K elements
+  int ker_c_stride = K * K;       // moving one channel in the kernel skips K*K elements
+  int out_m_stride = W * H;       // output is laid out as [m][w][h], so moving one kernel skips W*H elements
 
+  // iterate over this thread's assigned range of output kernels
   for (int m = a->m_start; m < a->m_end; m++) {
     int ker_m_base = m * ker_m_stride;
     int out_m_base = m * out_m_stride;
 
     for (int w = 0; w < W; w++) {
       for (int h = 0; h < H; h++) {
-        double sum = 0.0;
+        double sum = 0.0;   // use double to reduce floating point rounding errors
 
         for (int x = 0; x < K; x++) {
-          int img_wx_base = (w + x) * img_w_stride;
+          int img_wx_base = (w + x) * img_w_stride;       // base index into image for row (w+x)
           for (int y = 0; y < K; y++) {
-            int img_wxy_base = img_wx_base + (h + y) * C;
-            int ker_mxy_base = ker_m_base + x * K + y;
+            int img_wxy_base = img_wx_base + (h + y) * C; // index into image at position [w+x][h+y][0]
+            int ker_mxy_base = ker_m_base + x * K + y;    // index into kernel at position [m][0][x][y]
+
+            // channel loop is innermost so image access is sequential in memory
             for (int c = 0; c < C; c++) {
               // c is innermost so image access is sequential - the cache thanks us!
               sum += img[img_wxy_base + c]
@@ -400,17 +404,19 @@ void student_conv_pthreads(float *** image, int16_t **** kernels, float *** outp
   pthread_t   threads[NUM_THREADS];
   conv_args_t args[NUM_THREADS];
 
-  // pull out the raw 1D backing arrays - avoids pointer chasing on every access
+  // extract the raw 1D backing arrays to avoid pointer chasing on every access
   float   *image_1d  = **image;
   int16_t *kernel_1d = ***kernels;
   float   *output_1d = **output;
 
-  /* no mutex needed - each thread writes to its own disjoint set of output
-     kernels (m_start..m_end-1), so there's no shared mutable state */
+  // use fewer threads if there are fewer kernels than threads
   int nthreads = (nkernels < NUM_THREADS) ? nkernels : NUM_THREADS;
+
+  // divide kernels as evenly as possible: first 'extra' threads get one more kernel
   int base     = nkernels / nthreads;
   int extra    = nkernels % nthreads;
 
+  // create threads, each with its own range of kernels to process
   for (int t = 0; t < nthreads; t++) {
     args[t].image_1d     = image_1d;
     args[t].kernel_1d    = kernel_1d;
@@ -420,12 +426,14 @@ void student_conv_pthreads(float *** image, int16_t **** kernels, float *** outp
     args[t].nchannels    = nchannels;
     args[t].nkernels     = nkernels;
     args[t].kernel_order = kernel_order;
-    // spread kernels as evenly as possible across threads 
+
+    // compute the start and end kernel indices for this thread
     args[t].m_start = t * base + (t < extra ? t     : extra);
     args[t].m_end   = args[t].m_start + base + (t < extra ? 1 : 0);
     pthread_create(&threads[t], NULL, conv_thread_func, &args[t]);
   }
 
+  // wait for all threads to finish before returning
   for (int t = 0; t < nthreads; t++) {
     pthread_join(threads[t], NULL);
   }
@@ -440,14 +448,13 @@ void student_conv_openmp(float *** image, int16_t **** kernels, float *** output
                int width, int height, int nchannels, int nkernels,
                int kernel_order)
 {
-  // this call here is just dummy code that calls the slow, simple, correct version.
-  // insert your own code instead
   int h, w, x, y, c, m;
   int korder2 = kernel_order * kernel_order;
   int padded_w = width + kernel_order - 1;
   int padded_h = height + kernel_order - 1;
 
-  // Flatten the image into a 1d array to reduce the penalty from triple pointer dereferences
+  /* flatten image from 3D pointer structure to contiguous 1D array
+     layout: [w][h][c] — channels contiguous for sequential inner-loop access */
   float *flat_image = malloc(padded_w * padded_h * nchannels * sizeof(float));
   #pragma omp parallel for collapse(2) schedule(static)
   for (int i = 0; i < padded_w; i++) {
@@ -458,7 +465,8 @@ void student_conv_openmp(float *** image, int16_t **** kernels, float *** output
     }
   }
 
-  // Flatten the kernel into another 1d array to reduce the penalty from quadruple pointer dereferences
+  /* flatten and reorder kernel from [m][c][x][y] to [m][x][y][c]
+     this makes the channel loop sequential in memory for both image and kernel */
   float *flat_kernel = malloc(nkernels * korder2 * nchannels * sizeof(float));
   #pragma omp parallel for collapse(2) schedule(static)
   for (int i = 0; i < nkernels; i++) {
@@ -471,18 +479,26 @@ void student_conv_openmp(float *** image, int16_t **** kernels, float *** output
     }
   }
 
-  // Main convolution group with OpenMP pragmas parallelising the outer 2 loops
+  /* main convolution loop
+     collapse(2) fuses m and w loops into one iteration space (nkernels * width)
+     to keep all threads busy rather than just parallelising over nkernels
+     schedule(static) splits work evenly since each iteration does the same amount
+     private(h, x, y, c) gives each thread its own copy of inner loop variables */
   #pragma omp parallel for collapse(2) schedule(static) private(h, x, y, c)
   for ( m = 0; m < nkernels; m++ ) {
     for ( w = 0; w < width; w++ ) {
       for ( h = 0; h < height; h++ ) {
-        double sum = 0.0;
-        int base_kernel = m * korder2 * nchannels;
+        double sum = 0.0;                           // double for reduced floating point error
+        int base_kernel = m * korder2 * nchannels;  // precompute the base offset for this kernel's weights
+
         for ( x = 0; x < kernel_order; x++ ) {
           for ( y = 0; y < kernel_order; y++) {
+            // precompute offsets so only 'c' varies in the inner loop
             int image_offset = ((w + x) * padded_h + (h + y)) * nchannels;
             int kernel_offset = base_kernel + (x * kernel_order + y) * nchannels;
-            // use a reduction since we are summing from all the threads into the one sum variable
+
+            /* vectorise the innermost loop using SIMD with reduction
+               each SIMD lane accumulates partial sums that are combined at the end */
             #pragma omp simd reduction(+:sum)
             for ( c = 0; c < nchannels; c++ ) {
               sum += (double)flat_image[image_offset + c] * (double)flat_kernel[kernel_offset + c];
@@ -493,6 +509,7 @@ void student_conv_openmp(float *** image, int16_t **** kernels, float *** output
       }
     }
   }
+  // free the temporary flattened arrays
   free(flat_image);
   free(flat_kernel);  
 }
